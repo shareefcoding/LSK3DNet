@@ -138,6 +138,7 @@ class point_semkitti_mix(data.Dataset):
         ref_pc = xyz.copy()
         ref_labels = labels.copy()
         ref_index = np.arange(len(ref_pc))
+        
 
         mask_x = np.logical_and(xyz[:, 0] > self.min_volume_space[0], xyz[:, 0] < self.max_volume_space[0])
         mask_y = np.logical_and(xyz[:, 1] > self.min_volume_space[1], xyz[:, 1] < self.max_volume_space[1])
@@ -214,22 +215,69 @@ class point_semkitti_mix(data.Dataset):
         
         return data_dict
 
+# Original
+# @register_collate_fn
+# def mix_collate_fn_default(data):
+#     point_num = [d['point_num'] for d in data]
+#     batch_size = len(point_num)
+#     ref_labels = data[0]['ref_label']
+#     origin_len = data[0]['origin_len']
+#     ref_indices = [torch.from_numpy(d['ref_index']) for d in data]
+#     path = data[0]['root'] # [d['root'] for d in data]
+
+#     b_idx = []
+#     for i in range(batch_size):
+#         b_idx.append(torch.ones(point_num[i]) * i)
+#     points = [torch.from_numpy(d['point_feat']) for d in data]
+#     ref_xyz = [torch.from_numpy(d['ref_xyz']) for d in data]
+#     labels = [torch.from_numpy(d['point_label']) for d in data]
+#     normal = [torch.from_numpy(d['normal']) for d in data]
+
+#     raw_points = [torch.from_numpy(d['raw_points']) for d in data]
+
+#     return {
+#         'points': torch.cat(points).float(),
+#         'normal': torch.cat(normal).float(),
+#         'ref_xyz': torch.cat(ref_xyz).float(),
+#         'batch_idx': torch.cat(b_idx).long(),
+#         'batch_size': batch_size,
+#         'labels': torch.cat(labels).long().squeeze(1),
+#         'raw_labels': torch.from_numpy(ref_labels).long(),
+#         'origin_len': origin_len,
+#         'indices': torch.cat(ref_indices).long(),
+#         'path': path,
+#         'point_num': point_num, 
+
+#         'raw_points': torch.cat(raw_points).float(),
+#     }
+
+# New
 @register_collate_fn
 def mix_collate_fn_default(data):
     point_num = [d['point_num'] for d in data]
     batch_size = len(point_num)
     ref_labels = data[0]['ref_label']
     origin_len = data[0]['origin_len']
-    ref_indices = [torch.from_numpy(d['ref_index']) for d in data]
-    path = data[0]['root'] # [d['root'] for d in data]
+    path = data[0]['root']
 
     b_idx = []
+    indices = []
+    points = []
+    ref_xyz = []
+    labels = []
+    normal = []
+    raw_points = []
+
     for i in range(batch_size):
-        b_idx.append(torch.ones(point_num[i]) * i)
-    points = [torch.from_numpy(d['point_feat']) for d in data]
-    ref_xyz = [torch.from_numpy(d['ref_xyz']) for d in data]
-    labels = [torch.from_numpy(d['point_label']) for d in data]
-    normal = [torch.from_numpy(d['normal']) for d in data]
+        num_points = point_num[i]
+        b_idx.append(torch.ones(num_points) * i)
+        # Offset indices
+        indices.append(torch.from_numpy(data[i]['ref_index']))
+        points.append(torch.from_numpy(data[i]['point_feat']))
+        ref_xyz.append(torch.from_numpy(data[i]['ref_xyz']))
+        labels.append(torch.from_numpy(data[i]['point_label']))
+        normal.append(torch.from_numpy(data[i]['normal']))
+        raw_points.append(torch.from_numpy(data[i]['raw_points']))
 
     return {
         'points': torch.cat(points).float(),
@@ -240,9 +288,10 @@ def mix_collate_fn_default(data):
         'labels': torch.cat(labels).long().squeeze(1),
         'raw_labels': torch.from_numpy(ref_labels).long(),
         'origin_len': origin_len,
-        'indices': torch.cat(ref_indices).long(),
+        'indices': torch.cat(indices).long(),  # now indices are global
         'path': path,
-        'point_num': point_num, 
+        'point_num': point_num,
+        'raw_points': torch.cat(raw_points).float(),
     }
 
 
@@ -285,6 +334,9 @@ class point_image_dataset_nus(data.Dataset):
         ref_pc = xyz.copy()
         ref_labels = labels.copy()
         ref_index = np.arange(len(ref_pc))
+
+        # print("ref_index max:", ref_index.max(), "len raw_points:", len(np.concatenate((ref_pc, sig), axis=1)))
+
 
         mask_x = np.logical_and(xyz[:, 0] > self.min_volume_space[0], xyz[:, 0] < self.max_volume_space[0])
         mask_y = np.logical_and(xyz[:, 1] > self.min_volume_space[1], xyz[:, 1] < self.max_volume_space[1])
@@ -353,5 +405,7 @@ class point_image_dataset_nus(data.Dataset):
         data_dict['origin_len'] = origin_len
         data_dict['normal'] = unproj_normal_data
         data_dict['root'] = root
+
+        data_dict['raw_points'] = np.concatenate((ref_pc, sig), axis=1)
 
         return data_dict

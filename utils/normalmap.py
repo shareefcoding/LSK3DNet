@@ -96,55 +96,55 @@ def range_projection(current_vertex, fov_up=3.0, fov_down=-25.0, proj_H=64, proj
   return proj_range, proj_vertex, proj_intensity, proj_idx, from_proj_x, from_proj_y
 
 
-# def gen_normal_map(current_range, current_vertex, proj_H=64, proj_W=900):  # 高64，宽900
-#   """ Generate a normal image given the range projection of a point cloud.
-#       Args:
-#         current_range:  range projection of a point cloud, each pixel contains the corresponding depth
-#         current_vertex: range projection of a point cloud,
-#                         each pixel contains the corresponding point (x, y, z, 1)
-#       Returns: 
-#         normal_data: each pixel contains the corresponding normal
-#   """
-#   normal_data = np.full((proj_H, proj_W, 3), -1, dtype=np.float32)
+def gen_normal_map(current_range, current_vertex, proj_H=64, proj_W=900):  # 高64，宽900
+  """ Generate a normal image given the range projection of a point cloud.
+      Args:
+        current_range:  range projection of a point cloud, each pixel contains the corresponding depth
+        current_vertex: range projection of a point cloud,
+                        each pixel contains the corresponding point (x, y, z, 1)
+      Returns: 
+        normal_data: each pixel contains the corresponding normal
+  """
+  normal_data = np.full((proj_H, proj_W, 3), -1, dtype=np.float32)
   
-#   # iterate over all pixels in the range image
-#   for x in range(proj_W):
-#     for y in range(proj_H - 1):
-#       p = current_vertex[y, x][:3]
-#       depth = current_range[y, x]
+  # iterate over all pixels in the range image
+  for x in range(proj_W):
+    for y in range(proj_H - 1):
+      p = current_vertex[y, x][:3]
+      depth = current_range[y, x]
       
-#       if depth > 0:
-#         wrap_x = wrap(x + 1, proj_W)
-#         u = current_vertex[y, wrap_x][:3]
-#         u_depth = current_range[y, wrap_x]
-#         if u_depth <= 0:
-#           continue
+      if depth > 0:
+        wrap_x = wrap(x + 1, proj_W)
+        u = current_vertex[y, wrap_x][:3]
+        u_depth = current_range[y, wrap_x]
+        if u_depth <= 0:
+          continue
         
-#         v = current_vertex[y + 1, x][:3]
-#         v_depth = current_range[y + 1, x]
-#         if v_depth <= 0:
-#           continue
+        v = current_vertex[y + 1, x][:3]
+        v_depth = current_range[y + 1, x]
+        if v_depth <= 0:
+          continue
         
-#         u_norm = (u - p) / np.linalg.norm(u - p)
-#         v_norm = (v - p) / np.linalg.norm(v - p)
+        u_norm = (u - p) / np.linalg.norm(u - p)
+        v_norm = (v - p) / np.linalg.norm(v - p)
         
-#         w = np.cross(v_norm, u_norm)
-#         norm = np.linalg.norm(w)
-#         if norm > 0:
-#           normal = w / norm
-#           normal_data[y, x] = normal
+        w = np.cross(v_norm, u_norm)
+        norm = np.linalg.norm(w)
+        if norm > 0:
+          normal = w / norm
+          normal_data[y, x] = normal
   
-#   return normal_data
+  return normal_data
 
-# def wrap(x, dim):
-#   """ Wrap the boarder of the range image.
-#   """
-#   value = x
-#   if value >= dim:
-#     value = (value - dim)
-#   if value < 0:
-#     value = (value + dim)
-#   return value
+def wrap(x, dim):
+  """ Wrap the boarder of the range image.
+  """
+  value = x
+  if value >= dim:
+    value = (value - dim)
+  if value < 0:
+    value = (value + dim)
+  return value
 
 def compute_normals_range(current_vertex, fov_up=3.0, fov_down=-25.0, proj_H=64, proj_W=900, max_range=50, extrapolate = True, blur_type = 'gaussian'):
   """ compute normals for each point using range image-based method.

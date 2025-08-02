@@ -73,6 +73,8 @@ class SemKITTI_sk(data.Dataset):
         data_dict['signal'] = feat
         data_dict['origin_len'] = origin_len
 
+        data_dict['raw_points'] = raw_data
+
         return data_dict, self.im_idx[index]
 
 
@@ -186,6 +188,8 @@ class nuScenes(data.Dataset):
         data_dict['instance_label'] = instance_label
         data_dict['signal'] = pointcloud[:, 3:4]
         data_dict['origin_len'] = len(pointcloud)
+
+        data_dict['raw_points'] = pointcloud
 
         return data_dict, lidar_sample_token
 
