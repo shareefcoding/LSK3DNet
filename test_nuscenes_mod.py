@@ -250,13 +250,17 @@ def main_worker(local_rank, nprocs, configs):
                     dists, idxs = nbrs.kneighbors(radar_pts)
 
                     targets   = [2,3,4,5,6,7,9,10]
+                    touched = 0
                     for lids, dv in zip(idxs, dists):
                         for lid, dist in zip(lids, dv):
                             if dist > 1.0: 
                                 continue
+                            touched += 1
                             for c in targets:
                                 lidar_probs[lid][c] *= 1.5 * np.exp(-dist)
                             lidar_probs[lid] /= lidar_probs[lid].sum()
+
+                    print(f"Radar fusion touched {touched} LiDAR points in this frame")
 
                 # 4) final labels from boosted probs
                 predict_labels = np.argmax(lidar_probs, axis=1)
