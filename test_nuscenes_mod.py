@@ -187,7 +187,7 @@ def main_worker(local_rank, nprocs, configs):
         with torch.no_grad():
             for i_iter_val, (val_data_dict) in enumerate(val_dataset_loader):
                 print(i_iter_val)
-                if i_iter_val > 0:
+                if i_iter_val > 20:
                     break  # Only process the first sample
 
                 torch.cuda.empty_cache()
