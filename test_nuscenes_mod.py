@@ -35,6 +35,9 @@ from sklearn.cluster import DBSCAN
 
 from sklearn.neighbors import NearestNeighbors
 
+import cv2
+from pyquaternion import Quaternion
+
 #########
 
 # Visual
@@ -97,6 +100,22 @@ def reduce_tensor(tensor, world_size):
     return rt
 
 def main_worker(local_rank, nprocs, configs):
+
+    # Set the correct path to your YOLOv5 repository
+    yolov5_path = '/home/shareef/deep_learning/LSK3DNet_ROS2_Sensor_Fusion/yolov5'  # Adjust if different
+    # Temporarily change the working directory to the YOLOv5 directory
+    original_cwd = os.getcwd()
+    os.chdir(yolov5_path)
+
+    # Import and load the YOLOv5 model
+    from yolov5.hubconf import yolov5n  # Note: 'hubconf', not 'yolov5.hubconf', since we're in the yolov5/ directory
+    pytorch_device = torch.device('cuda:' + str(local_rank))
+    yolo_model = yolov5n(pretrained=True, device=pytorch_device)
+    yolo_model.eval()
+
+    # Revert to the original working directory
+    os.chdir(original_cwd)
+
     torch.autograd.set_detect_anomaly(True)
 
     dataset_config = configs['dataset_params']
@@ -297,6 +316,67 @@ def main_worker(local_rank, nprocs, configs):
                 predict_labels = np.argmax(lidar_probs, axis=1)
                 n_changed = np.sum(orig_preds!=predict_labels)
                 print(f"Fusion changed {n_changed}/{len(orig_preds)} points")
+
+                ####################################################################
+                # ── CAMERA FUSION WITH YOLOv5n ──
+
+                # assume `coords` (M×3) already extracted for LiDAR points
+                # and `vote_logits` is a torch.Tensor [M×C]
+
+                # prepare raw logits for boosting
+                logits_np = vote_logits.cpu().numpy().copy()
+
+                # for each nuScenes camera
+                cam_names = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_RIGHT',
+                            'CAM_BACK', 'CAM_BACK_LEFT',  'CAM_FRONT_LEFT']
+                for cam_name in cam_names:
+                    # 1) load image
+                    cam_token = sample['data'][cam_name]
+                    cam_info  = val_pt.nusc.get('sample_data', cam_token)
+                    img_path  = os.path.join(data_path, cam_info['filename'])
+                    img       = cv2.imread(img_path)                # requires import cv2
+
+                    # 2) run YOLOv5n
+                    yolo_res  = yolo_model(img)
+                    boxes     = yolo_res.xyxy[0].cpu().numpy()      # (N,6): x1,y1,x2,y2,conf,class
+
+                    if boxes.shape[0] == 0:
+                        continue
+
+                    # 3) get calibration to project LiDAR → image
+                    cs_rec    = val_pt.nusc.get('calibrated_sensor', cam_info['calibrated_sensor_token'])
+                    K         = np.array(cs_rec['camera_intrinsic'])  # 3×3
+                    trans     = np.array(cs_rec['translation'])
+                    rot       = np.array(cs_rec['rotation'])
+                    # build 4×4 ego→cam transform
+                    T_ego2cam = np.eye(4)
+                    T_ego2cam[:3,:3] = Quaternion(rot).rotation_matrix  # import from pyquaternion
+                    T_ego2cam[:3, 3] = trans
+
+                    # 4) project LiDAR points into camera
+                    pts_homog = np.concatenate([coords, np.ones((coords.shape[0],1))], axis=1)  # (M,4)
+                    pts_cam   = (T_ego2cam @ pts_homog.T).T                              # (M,4)
+                    uvw       = (K @ pts_cam[:,:3].T).T                                  # (M,3)
+                    uv        = uvw[:,:2] / uvw[:,2:3]                                   # (M,2)
+
+                    # 5) boost logits for points inside any detected box
+                    alpha = 2.0  # how strongly to trust the camera
+                    for x1,y1,x2,y2,conf,cls_id in boxes:
+                        if conf < 0.5:   # skip low‐confidence
+                            continue
+                        mask = (
+                            (uv[:,0]>=x1)&(uv[:,0]<=x2) &
+                            (uv[:,1]>=y1)&(uv[:,1]<=y2) &
+                            (uvw[:,2]>0)      # in front of camera
+                        )
+                        lids = np.nonzero(mask)[0]
+                        for lid in lids:
+                            logits_np[lid, int(cls_id)] += alpha * conf
+
+                # 6) re‐softmax & final labels
+                probs       = np.exp(logits_np)
+                probs      /= probs.sum(axis=1, keepdims=True)
+                predict_labels = np.argmax(probs, axis=1)
 
                 ####################################################################
 
