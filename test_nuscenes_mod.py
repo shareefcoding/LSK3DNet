@@ -218,6 +218,9 @@ def main_worker(local_rank, nprocs, configs):
 
                 ####################################################################
                 # Radar
+                orig_probs = F.softmax(vote_logits, dim=1).cpu().numpy()
+                orig_preds = np.argmax(orig_probs, axis=1)
+
                 # --- POST‐INFERENCE RADAR FUSION ---
                 # 1) softmax → probs
                 lidar_probs = F.softmax(vote_logits, dim=1).cpu().numpy()
@@ -228,42 +231,72 @@ def main_worker(local_rank, nprocs, configs):
                 sd_data     = val_pt.nusc.get('sample_data', lidar_token)
                 sample      = val_pt.nusc.get('sample', sd_data['sample_token'])
 
-                # 3) loop through all radar sensors
-                radar_keys = ['RADAR_FRONT', 'RADAR_FRONT_LEFT', 'RADAR_FRONT_RIGHT']
-                for rk in radar_keys:
-                    if rk not in sample['data']:
-                        continue
-                    rtok      = sample['data'][rk]
-                    rinfo     = val_pt.nusc.get('sample_data', rtok)
-                    rpath     = os.path.join(data_path, rinfo['filename'])
+                # # 3) loop through all radar sensors
+                # radar_keys = ['RADAR_FRONT', 'RADAR_FRONT_LEFT', 'RADAR_FRONT_RIGHT']
+                # for rk in radar_keys:
+                #     if rk not in sample['data']:
+                #         continue
+                #     rtok      = sample['data'][rk]
+                #     rinfo     = val_pt.nusc.get('sample_data', rtok)
+                #     rpath     = os.path.join(data_path, rinfo['filename'])
 
-                    # — load radar points robustly —
+                #     # — load radar points robustly —
+                #     if rpath.endswith('.pcd'):
+                #         pcd       = o3d.io.read_point_cloud(rpath)
+                #         radar_pts = np.asarray(pcd.points)
+                #     else:
+                #         rpc       = np.fromfile(rpath, dtype=np.float32).reshape(-1, 18)
+                #         radar_pts = rpc[:, :3]
+
+                #     # find neighbors & boost
+                #     nbrs      = NearestNeighbors(n_neighbors=5, radius=1.0).fit(coords)
+                #     dists, idxs = nbrs.kneighbors(radar_pts)
+
+                #     targets   = [2,3,4,5,6,7,9,10]
+                #     touched = 0
+                #     for lids, dv in zip(idxs, dists):
+                #         for lid, dist in zip(lids, dv):
+                #             if dist > 1.0: 
+                #                 continue
+                #             touched += 1
+                #             for c in targets:
+                #                 lidar_probs[lid][c] *= 1.5 * np.exp(-dist)
+                #             lidar_probs[lid] /= lidar_probs[lid].sum()
+
+                #     print(f"Radar fusion touched {touched} LiDAR points in this frame")
+                ## 3.1) more aggressive fusion
+                nbrs = NearestNeighbors(n_neighbors=10, radius=3.0).fit(coords)
+                for rk in ['RADAR_FRONT','RADAR_FRONT_LEFT','RADAR_FRONT_RIGHT']:
+                    if rk not in sample['data']: continue
+                    rtok  = sample['data'][rk]
+                    rinfo = val_pt.nusc.get('sample_data', rtok)
+                    rpath = os.path.join(data_path, rinfo['filename'])
+                    # robust pcd load...
                     if rpath.endswith('.pcd'):
-                        pcd       = o3d.io.read_point_cloud(rpath)
-                        radar_pts = np.asarray(pcd.points)
+                        pcd = o3d.io.read_point_cloud(rpath); radar_pts = np.asarray(pcd.points)
                     else:
-                        rpc       = np.fromfile(rpath, dtype=np.float32).reshape(-1, 18)
-                        radar_pts = rpc[:, :3]
-
-                    # find neighbors & boost
-                    nbrs      = NearestNeighbors(n_neighbors=5, radius=1.0).fit(coords)
+                        rpc = np.fromfile(rpath, dtype=np.float32).reshape(-1,18); radar_pts = rpc[:,:3]
                     dists, idxs = nbrs.kneighbors(radar_pts)
+                    targets = [2,3,4,5,6,7,9,10]
 
-                    targets   = [2,3,4,5,6,7,9,10]
-                    touched = 0
+                    logits_np   = vote_logits.cpu().numpy().copy()
+                    orig_preds  = np.argmax(logits_np, axis=1)
+
                     for lids, dv in zip(idxs, dists):
                         for lid, dist in zip(lids, dv):
-                            if dist > 1.0: 
+                            if dist > 2.0:
                                 continue
-                            touched += 1
-                            for c in targets:
-                                lidar_probs[lid][c] *= 1.5 * np.exp(-dist)
-                            lidar_probs[lid] /= lidar_probs[lid].sum()
-
-                    print(f"Radar fusion touched {touched} LiDAR points in this frame")
+                            if logits_np[lid].max() < np.log(0.7):  # approx <70% prob
+                                for c in targets:
+                                    logits_np[lid, c] += 2.0          # additive boost
+                    # 3) re‐softmax & predict
+                    probs        = np.exp(logits_np) / np.exp(logits_np).sum(axis=1, keepdims=True)
+                    predict_labels = np.argmax(probs, axis=1)
 
                 # 4) final labels from boosted probs
                 predict_labels = np.argmax(lidar_probs, axis=1)
+                n_changed = np.sum(orig_preds!=predict_labels)
+                print(f"Fusion changed {n_changed}/{len(orig_preds)} points")
 
                 ####################################################################
 
