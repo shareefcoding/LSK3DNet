@@ -33,6 +33,8 @@ import open3d as o3d
 import matplotlib.pyplot as plt
 from sklearn.cluster import DBSCAN
 
+from sklearn.neighbors import NearestNeighbors
+
 #########
 
 # Visual
@@ -159,6 +161,8 @@ def main_worker(local_rank, nprocs, configs):
         loader_config=val_dataloader_config,
         num_vote = configs.num_vote)
     
+    val_pt = val_pt_dataset
+    
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, num_replicas=train_hypers.world_size, rank=train_hypers.local_rank, shuffle=False)
     val_dataset_loader = torch.utils.data.DataLoader(dataset=val_dataset,
                                                     batch_size=val_dataloader_config["batch_size"],
@@ -187,7 +191,7 @@ def main_worker(local_rank, nprocs, configs):
         with torch.no_grad():
             for i_iter_val, (val_data_dict) in enumerate(val_dataset_loader):
                 print(i_iter_val)
-                if i_iter_val > 0:
+                if i_iter_val > 20:
                     break  # Only process the first sample
 
                 torch.cuda.empty_cache()
@@ -211,9 +215,53 @@ def main_worker(local_rank, nprocs, configs):
                 if train_hypers['distributed']:
                     torch.distributed.barrier()
                     vote_logits = reduce_tensor(vote_logits, nprocs)
-                    
-                predict_labels = torch.argmax(vote_logits, dim=1)
-                predict_labels = predict_labels.cpu().detach().numpy()
+
+                ####################################################################
+                # Radar
+                # --- POST‐INFERENCE RADAR FUSION ---
+                # 1) softmax → probs
+                lidar_probs = F.softmax(vote_logits, dim=1).cpu().numpy()
+                coords      = val_data_dict['points'][:, :3].cpu().numpy()
+
+                # 2) get this sample’s nuScenes tokens
+                lidar_token = val_pt.token_list[i_iter_val]['lidar_token']
+                sd_data     = val_pt.nusc.get('sample_data', lidar_token)
+                sample      = val_pt.nusc.get('sample', sd_data['sample_token'])
+
+                # 3) loop through all radar sensors
+                radar_keys = ['RADAR_FRONT', 'RADAR_FRONT_LEFT', 'RADAR_FRONT_RIGHT']
+                for rk in radar_keys:
+                    if rk not in sample['data']:
+                        continue
+                    rtok      = sample['data'][rk]
+                    rinfo     = val_pt.nusc.get('sample_data', rtok)
+                    rpath     = os.path.join(data_path, rinfo['filename'])
+
+                    # — load radar points robustly —
+                    if rpath.endswith('.pcd'):
+                        pcd       = o3d.io.read_point_cloud(rpath)
+                        radar_pts = np.asarray(pcd.points)
+                    else:
+                        rpc       = np.fromfile(rpath, dtype=np.float32).reshape(-1, 18)
+                        radar_pts = rpc[:, :3]
+
+                    # find neighbors & boost
+                    nbrs      = NearestNeighbors(n_neighbors=5, radius=1.0).fit(coords)
+                    dists, idxs = nbrs.kneighbors(radar_pts)
+
+                    targets   = [2,3,4,5,6,7,9,10]
+                    for lids, dv in zip(idxs, dists):
+                        for lid, dist in zip(lids, dv):
+                            if dist > 1.0: 
+                                continue
+                            for c in targets:
+                                lidar_probs[lid][c] *= 1.5 * np.exp(-dist)
+                            lidar_probs[lid] /= lidar_probs[lid].sum()
+
+                # 4) final labels from boosted probs
+                predict_labels = np.argmax(lidar_probs, axis=1)
+
+                ####################################################################
 
                 # 1) extract your M model‑input points
                 coords = val_data_dict['points'][:, :3].cpu().numpy()
@@ -231,11 +279,6 @@ def main_worker(local_rank, nprocs, configs):
                 raw_labels_np = raw_labels.cpu().numpy().squeeze()
                 hist = fast_hist_crop(predict_labels, raw_labels_np, unique_label)
                 hist_list.append(hist)
-
-
-            ####################################################################
-            
-            ####################################################################
 
         if train_hypers.local_rank == 0:
             print("Visualizing predictions...")
