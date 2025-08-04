@@ -294,26 +294,29 @@ def main_worker(local_rank, nprocs, configs):
                     uvw    = (K @ cam_p[:, :3].T).T                             # N×3
                     uv     = uvw[:, :2] / uvw[:, 2:3]                           # N×2
 
-                    # for each detection, boost the raw logit
-                    for (x1,y1,x2,y2), c, cid in zip(xyxy, conf, cls):
-                        if c < 0.5:
+                    alpha = 2.0  # confidence multiplier
+
+                    for (x1, y1, x2, y2), conf_score, cls_id in zip(xyxy, conf, cls):
+                        if conf_score < 0.5:
                             continue
 
-                        # mask over the N coords
+                        # mask the LiDAR points inside the 2D box
                         m = (
-                            (uv[:,0] >= x1) & (uv[:,0] <= x2) &
-                            (uv[:,1] >= y1) & (uv[:,1] <= y2) &
-                            (uvw[:,2]  > 0)
+                            (uv[:, 0] >= x1) & (uv[:, 0] <= x2) &
+                            (uv[:, 1] >= y1) & (uv[:, 1] <= y2) &
+                            (uvw[:, 2] > 0)
                         )
-                        if not m.any():
+                        if not np.any(m):
                             continue
 
-                        # find which raw‐indices those are
-                        lids     = np.nonzero(m)[0]            # indices into coords (0..N)
-                        raw_lids = indices_np[lids]            # indices into logits_np (0..M)
+                        # get lidar indices inside the box
+                        lidar_indices = np.nonzero(m)[0]       # indices into coords (0..N)
+                        raw_lidar_ids = indices_np[lidar_indices]  # indices into logits_np (0..M)
 
-                        # finally boost in the M×C array
-                        logits_np[raw_lids, cid] += 2.0 * c
+                        # SAFELY boost only the detected class
+                        for idx in raw_lidar_ids:
+                            if 0 <= cls_id < logits_np.shape[1]:
+                                logits_np[idx, cls_id] += alpha * conf_score
 
                 # --- 3) FINAL SOFTMAX + PREDICT ---
                 fused = np.exp(logits_np)
