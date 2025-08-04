@@ -204,218 +204,136 @@ def main_worker(local_rank, nprocs, configs):
         time_list = []
         visualization_results = []
         with torch.no_grad():
-            for i_iter_val, (val_data_dict) in enumerate(val_dataset_loader):
+            for i_iter_val, val_data_dict in enumerate(val_dataset_loader):
                 print(i_iter_val)
                 if i_iter_val > 4:
-                    break  # Only process the first sample
+                    break  # only process a few samples for debugging
 
+                # Move to device
                 torch.cuda.empty_cache()
                 raw_labels = val_data_dict['raw_labels'].to(pytorch_device)
-                vote_logits = torch.zeros(raw_labels.shape[0], model_config['num_classes']).to(pytorch_device)
-                indices = val_data_dict['indices'].to(pytorch_device)
+                indices    = val_data_dict['indices'].to(pytorch_device)
+                for k in ('points','normal','batch_idx','labels'):
+                    val_data_dict[k] = val_data_dict[k].to(pytorch_device)
 
-                val_data_dict['points'] = val_data_dict['points'].to(pytorch_device)
-                val_data_dict['normal'] = val_data_dict['normal'].to(pytorch_device)
-                val_data_dict['batch_idx'] = val_data_dict['batch_idx'].to(pytorch_device)
-                val_data_dict['labels'] = val_data_dict['labels'].to(pytorch_device)
+                # Forward pass & vote accumulation
+                torch.cuda.synchronize(); t0 = time.time()
+                out = my_model(val_data_dict)
+                torch.cuda.synchronize(); time_list.append(time.time() - t0)
 
-                torch.cuda.synchronize()
-                start_time = time.time()
-                val_data_dict = my_model(val_data_dict)
-                torch.cuda.synchronize()
-                time_list.append(time.time()-start_time)
-                logits = val_data_dict['logits']
-                vote_logits.index_add_(0, indices, logits)
-
+                M = raw_labels.shape[0]
+                vote_logits = torch.zeros(M, model_config['num_classes'], device=pytorch_device)
+                vote_logits.index_add_(0, indices, out['logits'])
                 if train_hypers['distributed']:
                     torch.distributed.barrier()
                     vote_logits = reduce_tensor(vote_logits, nprocs)
 
-                ####################################################################
-                # Radar
-                orig_probs = F.softmax(vote_logits, dim=1).cpu().numpy()
-                orig_preds = np.argmax(orig_probs, axis=1)
+                # Pull into numpy for fusion
+                logits_np = vote_logits.cpu().numpy()            # (M, C)
+                coords    = val_data_dict['points'][:, :3].cpu().numpy()  # (M, 3)
 
-                # --- POST‐INFERENCE RADAR FUSION ---
-                # 1) softmax → probs
-                lidar_probs = F.softmax(vote_logits, dim=1).cpu().numpy()
-                coords      = val_data_dict['points'][:, :3].cpu().numpy()
+                indices_np = val_data_dict['indices'].cpu().numpy()   # shape (N,)
 
-                # 2) get this sample’s nuScenes tokens
-                lidar_token = val_pt.token_list[i_iter_val]['lidar_token']
-                sd_data     = val_pt.nusc.get('sample_data', lidar_token)
-                sample      = val_pt.nusc.get('sample', sd_data['sample_token'])
-
-                # # 3) loop through all radar sensors
-                # radar_keys = ['RADAR_FRONT', 'RADAR_FRONT_LEFT', 'RADAR_FRONT_RIGHT']
-                # for rk in radar_keys:
-                #     if rk not in sample['data']:
-                #         continue
-                #     rtok      = sample['data'][rk]
-                #     rinfo     = val_pt.nusc.get('sample_data', rtok)
-                #     rpath     = os.path.join(data_path, rinfo['filename'])
-
-                #     # — load radar points robustly —
-                #     if rpath.endswith('.pcd'):
-                #         pcd       = o3d.io.read_point_cloud(rpath)
-                #         radar_pts = np.asarray(pcd.points)
-                #     else:
-                #         rpc       = np.fromfile(rpath, dtype=np.float32).reshape(-1, 18)
-                #         radar_pts = rpc[:, :3]
-
-                #     # find neighbors & boost
-                #     nbrs      = NearestNeighbors(n_neighbors=5, radius=1.0).fit(coords)
-                #     dists, idxs = nbrs.kneighbors(radar_pts)
-
-                #     targets   = [2,3,4,5,6,7,9,10]
-                #     touched = 0
-                #     for lids, dv in zip(idxs, dists):
-                #         for lid, dist in zip(lids, dv):
-                #             if dist > 1.0: 
-                #                 continue
-                #             touched += 1
-                #             for c in targets:
-                #                 lidar_probs[lid][c] *= 1.5 * np.exp(-dist)
-                #             lidar_probs[lid] /= lidar_probs[lid].sum()
-
-                #     print(f"Radar fusion touched {touched} LiDAR points in this frame")
-                ## 3.1) more aggressive fusion
+                # --- 1) RADAR BOOST ---
                 nbrs = NearestNeighbors(n_neighbors=10, radius=3.0).fit(coords)
-                for rk in ['RADAR_FRONT','RADAR_FRONT_LEFT','RADAR_FRONT_RIGHT']:
-                    if rk not in sample['data']: continue
-                    rtok  = sample['data'][rk]
-                    rinfo = val_pt.nusc.get('sample_data', rtok)
-                    rpath = os.path.join(data_path, rinfo['filename'])
-                    # robust pcd load...
-                    if rpath.endswith('.pcd'):
-                        pcd = o3d.io.read_point_cloud(rpath); radar_pts = np.asarray(pcd.points)
-                    else:
-                        rpc = np.fromfile(rpath, dtype=np.float32).reshape(-1,18); radar_pts = rpc[:,:3]
-                    dists, idxs = nbrs.kneighbors(radar_pts)
-                    targets = [2,3,4,5,6,7,9,10]
+                lidar_sd = val_pt.token_list[i_iter_val]['lidar_token']
+                sd       = val_pt.nusc.get('sample_data', lidar_sd)
+                samp     = val_pt.nusc.get('sample', sd['sample_token'])
 
-                    logits_np   = vote_logits.cpu().numpy().copy()
-                    orig_preds  = np.argmax(logits_np, axis=1)
-                    indices_np = val_data_dict['indices'].cpu().numpy()
-                    for lids, dv in zip(idxs, dists):
-                        for lid, dist in zip(lids, dv):
-                            if dist > 2.0:
-                                continue
-
-                            raw_idx = indices_np[lid]         # <-- map back to raw index
-
-                            # now safe to index into logits_np
-                            if logits_np[raw_idx].max() < np.log(0.7):
-                                for c in targets:
-                                    logits_np[raw_idx, c] += 2.0
-                    # 3) re‐softmax & predict
-                    probs        = np.exp(logits_np) / np.exp(logits_np).sum(axis=1, keepdims=True)
-                    predict_labels = np.argmax(probs, axis=1)
-
-                # 4) final labels from boosted probs
-                predict_labels = np.argmax(lidar_probs, axis=1)
-                n_changed = np.sum(orig_preds!=predict_labels)
-                print(f"Fusion changed {n_changed}/{len(orig_preds)} points")
-
-                ####################################################################
-                # ── CAMERA FUSION WITH YOLOv5n ──
-
-                # assume `coords` (M×3) already extracted for LiDAR points
-                # and `vote_logits` is a torch.Tensor [M×C]
-
-                # prepare raw logits for boosting
-                logits_np = vote_logits.cpu().numpy().copy()
-
-                # for each nuScenes camera
-                cam_names = ['CAM_FRONT', 'CAM_FRONT_RIGHT', 'CAM_BACK_RIGHT',
-                            'CAM_BACK', 'CAM_BACK_LEFT',  'CAM_FRONT_LEFT']
-                for cam_name in cam_names:
-                    # 1) load image
-                    cam_token = sample['data'][cam_name]
-                    cam_info  = val_pt.nusc.get('sample_data', cam_token)
-                    img_path  = os.path.join(data_path, cam_info['filename'])
-                    if not os.path.isfile(img_path):
-                        print(f"Missing image: {img_path}")
+                targets = [2,3,4,5,6,7,9,10]
+                for rk in ('RADAR_FRONT','RADAR_FRONT_LEFT','RADAR_FRONT_RIGHT'):
+                    if rk not in samp['data']:
                         continue
-                    img       = cv2.imread(img_path)                # requires import cv2
+                    rd   = val_pt.nusc.get('sample_data', samp['data'][rk])
+                    path = os.path.join(data_path, rd['filename'])
 
-                    # 2) run YOLOv8n
-                    yolo_res_list = yolo_model(img)                # returns a list of Results
-                    res0          = yolo_res_list[0]               # first (and only) image
-
-                    # each `res0` has a `.boxes` object with tensors .xyxy, .conf, .cls
-                    xyxy = res0.boxes.xyxy.cpu().numpy()           # (N,4) x1,y1,x2,y2
-                    conf = res0.boxes.conf.cpu().numpy()           # (N,) confidences
-                    cls  = res0.boxes.cls.cpu().numpy().astype(int) # (N,) class ids
-
-                    # stack them into the same (N,6) format you expected:
-                    if xyxy.shape[0] > 0:
-                        boxes = np.concatenate([xyxy,
-                                                conf[:,None],
-                                                cls [:,None]],
-                                            axis=1)               # (N,6): x1,y1,x2,y2,conf,class
+                    # load radar points robustly
+                    arr = np.fromfile(path, dtype=np.float32)
+                    if arr.size % 18 == 0:
+                        radar_pts = arr.reshape(-1,18)[:,:3]
                     else:
-                        boxes = np.zeros((0,6),dtype=float)
-
-                    if boxes.shape[0] == 0:
-                        continue
-
-                    # 3) get calibration to project LiDAR → image
-                    cs_rec    = val_pt.nusc.get('calibrated_sensor', cam_info['calibrated_sensor_token'])
-                    K         = np.array(cs_rec['camera_intrinsic'])  # 3×3
-                    trans     = np.array(cs_rec['translation'])
-                    rot       = np.array(cs_rec['rotation'])
-                    # build 4×4 ego→cam transform
-                    T_ego2cam = np.eye(4)
-                    T_ego2cam[:3,:3] = Quaternion(rot).rotation_matrix  # import from pyquaternion
-                    T_ego2cam[:3, 3] = trans
-
-                    # 4) project LiDAR points into camera
-                    pts_homog = np.concatenate([coords, np.ones((coords.shape[0],1))], axis=1)  # (M,4)
-                    pts_cam   = (T_ego2cam @ pts_homog.T).T                              # (M,4)
-                    uvw       = (K @ pts_cam[:,:3].T).T                                  # (M,3)
-                    uv        = uvw[:,:2] / uvw[:,2:3]                                   # (M,2)
-
-                    # 5) boost logits for points inside any detected box
-                    alpha = 2.0  # how strongly to trust the camera
-                    for x1,y1,x2,y2,conf,cls_id in boxes:
-                        if conf < 0.5:   # skip low‐confidence
+                        try:
+                            pcd = o3d.io.read_point_cloud(path)
+                            radar_pts = np.asarray(pcd.points)
+                        except:
                             continue
-                        mask = (
-                            (uv[:,0]>=x1)&(uv[:,0]<=x2) &
-                            (uv[:,1]>=y1)&(uv[:,1]<=y2) &
-                            (uvw[:,2]>0)      # in front of camera
-                        )
-                        lids = np.nonzero(mask)[0]
-                        for lid in lids:
-                            # skip any spuriously large or negative indices
-                            if lid < 0 or lid >= logits_np.shape[0]:
-                                continue
-                            logits_np[lid, int(cls_id)] += alpha * conf
 
-                # 6) re‐softmax & final labels
-                probs       = np.exp(logits_np)
-                probs      /= probs.sum(axis=1, keepdims=True)
-                predict_labels = np.argmax(probs, axis=1)
+                    dists, idxs = nbrs.kneighbors(radar_pts)
+                    for lids, ds in zip(idxs, dists):
+                        for l, d in zip(lids, ds):
+                            raw_l = indices_np[l]                      # map back to [0..M)
+                            if d < 2.0 and logits_np[raw_l].max() < np.log(0.7):
+                                logits_np[raw_l, targets] += 2.0
+
+                # --- 2) CAMERA BOOST ---
+                cam_names = ['CAM_FRONT','CAM_FRONT_RIGHT','CAM_BACK_RIGHT',
+                            'CAM_BACK','CAM_BACK_LEFT','CAM_FRONT_LEFT']
+
+                for cam_name in cam_names:
+                    if cam_name not in samp['data']:
+                        continue
+
+                    # load image & run YOLOv8
+                    cd   = val_pt.nusc.get('sample_data', samp['data'][cam_name])
+                    img  = cv2.imread(os.path.join(data_path, cd['filename']))
+                    if img is None:
+                        continue
+                    res0 = yolo_model(img)[0]
+                    xyxy = res0.boxes.xyxy.cpu().numpy()    # (K,4)
+                    conf = res0.boxes.conf.cpu().numpy()    # (K,)
+                    cls  = res0.boxes.cls.cpu().numpy().astype(int)  # (K,)
+
+                    # project LiDAR coords into this camera
+                    cs   = val_pt.nusc.get('calibrated_sensor', cd['calibrated_sensor_token'])
+                    K    = np.array(cs['camera_intrinsic'])
+                    T    = np.eye(4)
+                    T[:3,:3] = Quaternion(cs['rotation']).rotation_matrix
+                    T[:3, 3] = cs['translation']
+                    pts_h  = np.hstack([coords, np.ones((coords.shape[0],1))])  # N×4
+                    cam_p  = (T @ pts_h.T).T                                    # N×4
+                    uvw    = (K @ cam_p[:, :3].T).T                             # N×3
+                    uv     = uvw[:, :2] / uvw[:, 2:3]                           # N×2
+
+                    # for each detection, boost the raw logit
+                    for (x1,y1,x2,y2), c, cid in zip(xyxy, conf, cls):
+                        if c < 0.5:
+                            continue
+
+                        # mask over the N coords
+                        m = (
+                            (uv[:,0] >= x1) & (uv[:,0] <= x2) &
+                            (uv[:,1] >= y1) & (uv[:,1] <= y2) &
+                            (uvw[:,2]  > 0)
+                        )
+                        if not m.any():
+                            continue
+
+                        # find which raw‐indices those are
+                        lids     = np.nonzero(m)[0]            # indices into coords (0..N)
+                        raw_lids = indices_np[lids]            # indices into logits_np (0..M)
+
+                        # finally boost in the M×C array
+                        logits_np[raw_lids, cid] += 2.0 * c
+
+                # --- 3) FINAL SOFTMAX + PREDICT ---
+                fused = np.exp(logits_np)
+                fused /= fused.sum(axis=1, keepdims=True)
+                predict_labels = fused.argmax(axis=1)
+
+                # record visualization & histogram
+                coords_np = coords  # already (M,3)
+                indices_np = indices.cpu().numpy()
+                visualization_results.append({
+                    'points': coords_np,
+                    'labels': predict_labels[indices_np]
+                })
+                hist_list.append(
+                    fast_hist_crop(predict_labels,
+                                raw_labels.cpu().numpy().squeeze(),
+                                unique_label)
+                )
 
                 ####################################################################
-
-                # 1) extract your M model‑input points
-                coords = val_data_dict['points'][:, :3].cpu().numpy()
-
-                # 2) align labels by indices
-                indices_np = val_data_dict['indices'].cpu().numpy()
-                labels_aligned = predict_labels[indices_np]
-
-                # 3) store for later
-                visualization_results.append({
-                    'points': coords,           # shape (M,3)
-                    'labels': labels_aligned,   # shape (M,)
-                })
-
-                raw_labels_np = raw_labels.cpu().numpy().squeeze()
-                hist = fast_hist_crop(predict_labels, raw_labels_np, unique_label)
-                hist_list.append(hist)
 
         if train_hypers.local_rank == 0:
             print("Visualizing predictions...")
