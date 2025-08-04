@@ -38,6 +38,10 @@ from sklearn.neighbors import NearestNeighbors
 import cv2
 from pyquaternion import Quaternion
 
+yolov5_path = os.path.expanduser('/home/shareef/deep_learning/LSK3DNet_ROS2_Sensor_Fusion/yolov5')  # or wherever you cloned it
+if yolov5_path not in sys.path:
+    sys.path.insert(0, yolov5_path)
+
 #########
 
 # Visual
@@ -101,21 +105,6 @@ def reduce_tensor(tensor, world_size):
 
 def main_worker(local_rank, nprocs, configs):
 
-    # Set the correct path to your YOLOv5 repository
-    yolov5_path = '/home/shareef/deep_learning/LSK3DNet_ROS2_Sensor_Fusion/yolov5'  # Adjust if different
-    # Temporarily change the working directory to the YOLOv5 directory
-    original_cwd = os.getcwd()
-    os.chdir(yolov5_path)
-
-    # Import and load the YOLOv5 model
-    from yolov5.hubconf import yolov5n  # Note: 'hubconf', not 'yolov5.hubconf', since we're in the yolov5/ directory
-    pytorch_device = torch.device('cuda:' + str(local_rank))
-    yolo_model = yolov5n(pretrained=True, device=pytorch_device)
-    yolo_model.eval()
-
-    # Revert to the original working directory
-    os.chdir(original_cwd)
-
     torch.autograd.set_detect_anomaly(True)
 
     dataset_config = configs['dataset_params']
@@ -133,6 +122,13 @@ def main_worker(local_rank, nprocs, configs):
     pytorch_device = torch.device('cuda:' + str(local_rank))
     torch.backends.cudnn.benchmark = True
     torch.cuda.set_device(local_rank)
+
+    from ultralytics import YOLO
+
+    # load the nano model
+    yolo_model = YOLO('yolov8n.pt')  # will download if missing
+    # set device
+    yolo_model.to(pytorch_device)
 
     seed = train_hypers.seed + local_rank * dataset_config.val_data_loader.num_workers * train_hypers['max_num_epochs']
     random.seed(seed)
@@ -210,7 +206,7 @@ def main_worker(local_rank, nprocs, configs):
         with torch.no_grad():
             for i_iter_val, (val_data_dict) in enumerate(val_dataset_loader):
                 print(i_iter_val)
-                if i_iter_val > 20:
+                if i_iter_val > 4:
                     break  # Only process the first sample
 
                 torch.cuda.empty_cache()
@@ -300,14 +296,18 @@ def main_worker(local_rank, nprocs, configs):
 
                     logits_np   = vote_logits.cpu().numpy().copy()
                     orig_preds  = np.argmax(logits_np, axis=1)
-
+                    indices_np = val_data_dict['indices'].cpu().numpy()
                     for lids, dv in zip(idxs, dists):
                         for lid, dist in zip(lids, dv):
                             if dist > 2.0:
                                 continue
-                            if logits_np[lid].max() < np.log(0.7):  # approx <70% prob
+
+                            raw_idx = indices_np[lid]         # <-- map back to raw index
+
+                            # now safe to index into logits_np
+                            if logits_np[raw_idx].max() < np.log(0.7):
                                 for c in targets:
-                                    logits_np[lid, c] += 2.0          # additive boost
+                                    logits_np[raw_idx, c] += 2.0
                     # 3) re‐softmax & predict
                     probs        = np.exp(logits_np) / np.exp(logits_np).sum(axis=1, keepdims=True)
                     predict_labels = np.argmax(probs, axis=1)
@@ -334,11 +334,28 @@ def main_worker(local_rank, nprocs, configs):
                     cam_token = sample['data'][cam_name]
                     cam_info  = val_pt.nusc.get('sample_data', cam_token)
                     img_path  = os.path.join(data_path, cam_info['filename'])
+                    if not os.path.isfile(img_path):
+                        print(f"Missing image: {img_path}")
+                        continue
                     img       = cv2.imread(img_path)                # requires import cv2
 
-                    # 2) run YOLOv5n
-                    yolo_res  = yolo_model(img)
-                    boxes     = yolo_res.xyxy[0].cpu().numpy()      # (N,6): x1,y1,x2,y2,conf,class
+                    # 2) run YOLOv8n
+                    yolo_res_list = yolo_model(img)                # returns a list of Results
+                    res0          = yolo_res_list[0]               # first (and only) image
+
+                    # each `res0` has a `.boxes` object with tensors .xyxy, .conf, .cls
+                    xyxy = res0.boxes.xyxy.cpu().numpy()           # (N,4) x1,y1,x2,y2
+                    conf = res0.boxes.conf.cpu().numpy()           # (N,) confidences
+                    cls  = res0.boxes.cls.cpu().numpy().astype(int) # (N,) class ids
+
+                    # stack them into the same (N,6) format you expected:
+                    if xyxy.shape[0] > 0:
+                        boxes = np.concatenate([xyxy,
+                                                conf[:,None],
+                                                cls [:,None]],
+                                            axis=1)               # (N,6): x1,y1,x2,y2,conf,class
+                    else:
+                        boxes = np.zeros((0,6),dtype=float)
 
                     if boxes.shape[0] == 0:
                         continue
@@ -371,6 +388,9 @@ def main_worker(local_rank, nprocs, configs):
                         )
                         lids = np.nonzero(mask)[0]
                         for lid in lids:
+                            # skip any spuriously large or negative indices
+                            if lid < 0 or lid >= logits_np.shape[0]:
+                                continue
                             logits_np[lid, int(cls_id)] += alpha * conf
 
                 # 6) re‐softmax & final labels

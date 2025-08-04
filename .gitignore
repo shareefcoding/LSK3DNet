@@ -2,3 +2,4 @@ dataset/
 pretrained/
 output_nuscenes/
 yolov5/
+yolov8n.pt
