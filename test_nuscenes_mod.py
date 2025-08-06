@@ -103,6 +103,80 @@ def reduce_tensor(tensor, world_size):
     rt /= world_size
     return rt
 
+def visualize_predictions(visualization_results, SemKITTI_label_name, enable_vis=True):
+    if not enable_vis:
+        return
+
+    def get_color_map():
+        color_map = plt.get_cmap("tab20", 20)  # 20-class color map
+        return {i: (np.array(color_map(i)[:3]) * 255).astype(int) for i in range(20)}
+
+    def create_bbox(points):
+        aabb = o3d.geometry.AxisAlignedBoundingBox.create_from_points(o3d.utility.Vector3dVector(points))
+        return aabb
+
+    color_map = get_color_map()
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="LSK3DNet Scene Viewer", width=960, height=720)
+    render_option = vis.get_render_option()
+    render_option.background_color = np.array([0, 0, 0])  # optional black background
+    render_option.point_size = 1.0
+
+    for i, scene in enumerate(visualization_results):
+        vis.clear_geometries()
+
+        points = scene['points']
+        labels = scene['labels']
+        unique_classes = np.unique(labels)
+        colors = np.array([color_map[l] for l in labels]) / 255.0
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        vis.add_geometry(pcd)
+
+        # ----- Bounding Box Clustering per Semantic Class -----
+        target_classes = [2, 3, 4, 5, 6, 7, 9, 10]
+        print("Class Legend:")
+        for cls_id in unique_classes:
+            if cls_id not in target_classes:
+                continue
+            label_name = SemKITTI_label_name.get(cls_id + 1, f"class_{cls_id+1}")
+            color = color_map[cls_id]
+            print(f"Class {cls_id}: {label_name} - Color RGB: {color}")
+
+        for cls in unique_classes:
+            if cls not in target_classes:
+                continue
+            mask = labels == cls
+            class_points = points[mask]
+            if len(class_points) < 30:
+                continue
+            clustering = DBSCAN(eps=1.0, min_samples=10).fit(class_points)
+            cluster_labels = clustering.labels_
+            for cluster_id in np.unique(cluster_labels):
+                if cluster_id == -1:
+                    continue
+                cluster_mask = cluster_labels == cluster_id
+                cluster_pts = class_points[cluster_mask]
+                if len(cluster_pts) < 20:
+                    continue
+                bbox = create_bbox(cluster_pts)
+                bbox.color = np.array(color_map[cls]) / 255.0
+                vis.add_geometry(bbox)
+
+        ctr = vis.get_view_control()
+        ctr.set_zoom(0.25)
+
+        vis.poll_events()
+        vis.update_renderer()
+        time.sleep(0.5)
+
+    vis.destroy_window()
+
+
 def main_worker(local_rank, nprocs, configs):
 
     torch.autograd.set_detect_anomaly(True)
@@ -206,7 +280,7 @@ def main_worker(local_rank, nprocs, configs):
         with torch.no_grad():
             for i_iter_val, val_data_dict in enumerate(val_dataset_loader):
                 print(i_iter_val)
-                if i_iter_val > 4:
+                if i_iter_val > 99:
                     break  # only process a few samples for debugging
 
                 # Move to device
@@ -258,6 +332,10 @@ def main_worker(local_rank, nprocs, configs):
                         except:
                             continue
 
+                    mask = np.isfinite(radar_pts).all(axis=1)
+                    radar_pts = radar_pts[mask]
+                    if radar_pts.shape[0] == 0:
+                        continue
                     dists, idxs = nbrs.kneighbors(radar_pts)
                     for lids, ds in zip(idxs, dists):
                         for l, d in zip(lids, ds):
@@ -336,81 +414,12 @@ def main_worker(local_rank, nprocs, configs):
                                 unique_label)
                 )
 
-                ####################################################################
 
         if train_hypers.local_rank == 0:
             print("Visualizing predictions...")
-            
-            def get_color_map():
-                import matplotlib.pyplot as plt
-                color_map = plt.get_cmap("tab20", 20)  # 20-class color map
-                return {i: (np.array(color_map(i)[:3]) * 255).astype(int) for i in range(20)}
 
-            color_map = get_color_map()
-
-            vis = o3d.visualization.Visualizer()
-            vis.create_window(window_name="LSK3DNet Scene Viewer", width=960, height=720)
-            render_option = vis.get_render_option()
-            render_option.background_color = np.array([0, 0, 0])  # optional black background
-            render_option.point_size = 1.0
-
-            for i, scene in enumerate(visualization_results):
-                vis.clear_geometries()
-
-                points = scene['points']
-                labels = scene['labels']
-                unique_classes = np.unique(labels)
-                colors = np.array([color_map[l] for l in labels]) / 255.0
-
-                pcd = o3d.geometry.PointCloud()
-                pcd.points = o3d.utility.Vector3dVector(points)
-                pcd.colors = o3d.utility.Vector3dVector(colors)
-
-                vis.add_geometry(pcd)
-
-                # ----- Bounding Box Clustering per Semantic Class -----
-                unique_classes = np.unique(labels)
-
-                # Filter class IDs of interest (based on 16-class mapping):
-                # 4 = car, 6 = motorcycle, 7 = pedestrian, 3 = bus, 10 = truck, 5 = construction_vehicle, 9 = trailer, 2 = bicycle
-                target_classes = [2, 3, 4, 5, 6, 7, 9, 10]
-                print("Class Legend:")
-                for cls_id in unique_classes:
-                    if cls_id not in target_classes:
-                        continue
-                    label_name = SemKITTI_label_name.get(cls_id + 1, f"class_{cls_id+1}")
-                    color = color_map[cls_id]
-                    print(f"Class {cls_id}: {label_name} - Color RGB: {color}")
-
-                for cls in unique_classes:
-                    if cls not in target_classes:
-                        continue
-                    mask = labels == cls
-                    class_points = points[mask]
-                    if len(class_points) < 30:
-                        continue
-                    clustering = DBSCAN(eps=1.0, min_samples=10).fit(class_points)
-                    cluster_labels = clustering.labels_
-                    for cluster_id in np.unique(cluster_labels):
-                        if cluster_id == -1:
-                            continue
-                        cluster_mask = cluster_labels == cluster_id
-                        cluster_pts = class_points[cluster_mask]
-                        if len(cluster_pts) < 20:
-                            continue
-                        bbox = create_bbox(cluster_pts)
-                        bbox.color = np.array(color_map[cls]) / 255.0  # Color bbox by class
-                        vis.add_geometry(bbox)
-
-                ctr = vis.get_view_control()
-                ctr.set_zoom(0.25)
-
-                vis.poll_events()
-                vis.update_renderer()
-                time.sleep(0.5)
-
-            vis.destroy_window()
-
+            # Visualization
+            visualize_predictions(visualization_results, SemKITTI_label_name, enable_vis=False)
 
             iou = per_class_iu(sum(hist_list))
             print('Validation per class iou: ')
