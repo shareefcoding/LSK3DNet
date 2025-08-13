@@ -277,11 +277,12 @@ def main_worker(local_rank, nprocs, configs):
         hist_list = []
         time_list = []
         visualization_results = []
+        hist_list_before = []
         with torch.no_grad():
             for i_iter_val, val_data_dict in enumerate(val_dataset_loader):
                 print(i_iter_val)
-                if i_iter_val > 99:
-                    break  # only process a few samples for debugging
+                # if i_iter_val > 49:
+                #     break  # only process a few samples for debugging
 
                 # Move to device
                 torch.cuda.empty_cache()
@@ -303,12 +304,29 @@ def main_worker(local_rank, nprocs, configs):
                     vote_logits = reduce_tensor(vote_logits, nprocs)
 
                 # Pull into numpy for fusion
-                logits_np = vote_logits.cpu().numpy()            # (M, C)
-                coords    = val_data_dict['points'][:, :3].cpu().numpy()  # (M, 3)
+                logits_np = vote_logits.cpu().numpy()                      # (M, C)
+                coords    = val_data_dict['points'][:, :3].cpu().numpy()   # (N, 3)
+                indices_np = val_data_dict['indices'].cpu().numpy()        # (N,)
 
-                indices_np = val_data_dict['indices'].cpu().numpy()   # shape (N,)
+                # ==============================
+                # Baseline EVAL (BEFORE Fusion)
+                # ==============================
+                # No extra persistent vars: compute argmax inline.
+                baseline_hist = fast_hist_crop(
+                    logits_np.argmax(axis=1),
+                    raw_labels.cpu().numpy().squeeze(),
+                    unique_label
+                )
+                hist_list_before.append(baseline_hist)
 
+                # Print running BEFORE-fusion mIoU
+                baseline_iou_running = per_class_iu(sum(hist_list_before))
+                baseline_miou_running = np.nanmean(baseline_iou_running) * 100
+                print("[BEFORE Fusion] running mIoU: %.3f" % baseline_miou_running)
+
+                # ==============================
                 # --- 1) RADAR BOOST ---
+                # ==============================
                 nbrs = NearestNeighbors(n_neighbors=10, radius=3.0).fit(coords)
                 lidar_sd = val_pt.token_list[i_iter_val]['lidar_token']
                 sd       = val_pt.nusc.get('sample_data', lidar_sd)
@@ -343,7 +361,9 @@ def main_worker(local_rank, nprocs, configs):
                             if d < 2.0 and logits_np[raw_l].max() < np.log(0.7):
                                 logits_np[raw_l, targets] += 2.0
 
+                # ==============================
                 # --- 2) CAMERA BOOST ---
+                # ==============================
                 cam_names = ['CAM_FRONT','CAM_FRONT_RIGHT','CAM_BACK_RIGHT',
                             'CAM_BACK','CAM_BACK_LEFT','CAM_FRONT_LEFT']
 
@@ -388,7 +408,7 @@ def main_worker(local_rank, nprocs, configs):
                             continue
 
                         # get lidar indices inside the box
-                        lidar_indices = np.nonzero(m)[0]       # indices into coords (0..N)
+                        lidar_indices = np.nonzero(m)[0]           # indices into coords (0..N)
                         raw_lidar_ids = indices_np[lidar_indices]  # indices into logits_np (0..M)
 
                         # SAFELY boost only the detected class
@@ -396,7 +416,9 @@ def main_worker(local_rank, nprocs, configs):
                             if 0 <= cls_id < logits_np.shape[1]:
                                 logits_np[idx, cls_id] += alpha * conf_score
 
-                # --- 3) FINAL SOFTMAX + PREDICT ---
+                # ==============================
+                # FINAL SOFTMAX + PREDICT (AFTER Fusion)
+                # ==============================
                 fused = np.exp(logits_np)
                 fused /= fused.sum(axis=1, keepdims=True)
                 predict_labels = fused.argmax(axis=1)
@@ -414,20 +436,38 @@ def main_worker(local_rank, nprocs, configs):
                                 unique_label)
                 )
 
+                # Print running AFTER-fusion mIoU
+                iou_running_after = per_class_iu(sum(hist_list))
+                miou_running_after = np.nanmean(iou_running_after) * 100
+                print("[AFTER  Fusion] running mIoU: %.3f" % miou_running_after)
 
+
+        # ==============================
+        # FINAL SUMMARY (END OF LOOP)
+        # ==============================
         if train_hypers.local_rank == 0:
             print("Visualizing predictions...")
-
-            # Visualization
             visualize_predictions(visualization_results, SemKITTI_label_name, enable_vis=False)
 
-            iou = per_class_iu(sum(hist_list))
-            print('Validation per class iou: ')
-            for class_name, class_iou in zip(unique_label_str,iou):
+            # FINAL AFTER-fusion
+            iou_after = per_class_iu(sum(hist_list))
+            val_miou_after = np.nanmean(iou_after) * 100
+
+            # FINAL BEFORE-fusion (baseline)
+            iou_before = per_class_iu(sum(hist_list_before))
+            val_miou_before = np.nanmean(iou_before) * 100
+
+            # Per-class table (optional)
+            print('Validation per class IoU (AFTER fusion): ')
+            for class_name, class_iou in zip(unique_label_str, iou_after):
                 print('%s : %.2f%%' % (class_name, class_iou*100))
-            val_miou = np.nanmean(iou) * 100
+
+            print("\n===== FINAL SUMMARY =====")
+            print("Baseline (BEFORE fusion) mIoU: %.3f" % val_miou_before)
+            print("Fused    (AFTER  fusion) mIoU: %.3f" % val_miou_after)
+            print("Δ mIoU (AFTER - BEFORE):     %.3f" % (val_miou_after - val_miou_before))
+
             pbar.close()
-            print('Current val miou is %.3f ' % val_miou)
             print('Inference time per %d is %.4f seconds\n' %
                 (dataset_config.val_data_loader.batch_size, np.mean(time_list)))
 
